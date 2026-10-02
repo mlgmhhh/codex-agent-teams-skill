@@ -1,0 +1,15 @@
+# 团队运行时状态（唯一真源 journal.jsonl 就在这里）
+.agent-team/
+
+# 依赖与构建产物
+node_modules/
+dist/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 日志（extras 里不提交运行日志）
+*.log
