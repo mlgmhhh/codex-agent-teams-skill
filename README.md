@@ -104,7 +104,8 @@ node $TEAM status                                 # 一屏摘要
 │       ├── agent-team.mjs    持久化团队 store（零依赖，可执行）
 │       └── README.md         CLI 速查、store 布局、worker 接线、与官方的差异与限制
 └── extras/                   可选：在你自己机器上跑一遍黑盒自测
-    ├── selftest.mjs          162 条断言，不消耗模型额度（需改第 7、8 行两个路径常量）
+    ├── selftest.mjs          162 条断言（协议/CLI/任务板/上限/冷恢复），不消耗模型额度
+    ├── selftest-storecopy.mjs 17 条断言：store 内 CLI 副本、默认 worker 沙箱 flag、--bootstrap 模板
     ├── fake-worker.mjs
     └── fail-worker.mjs
 ```
@@ -124,8 +125,9 @@ node $TEAM status                                 # 一屏摘要
 也在你自己的机器上验证（不花模型额度）：
 
 ```bash
-# 先改 extras/selftest.mjs 第 7、8 行为你的实际路径
-node extras/selftest.mjs        # 期望 TOTAL pass=162 fail=0, exit 0
+# 先改 extras/selftest.mjs 与 extras/selftest-storecopy.mjs 顶部的路径常量为你的实际路径
+node extras/selftest.mjs            # 期望 TOTAL pass=162 fail=0, exit 0
+node extras/selftest-storecopy.mjs  # 期望 TOTAL pass=17 fail=0, exit 0
 ```
 
 ## 已知限制
