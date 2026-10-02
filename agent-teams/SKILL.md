@@ -20,6 +20,8 @@ node "$HOME/.codex/skills/agent-teams/scripts/agent-team.mjs" <command> [options
 
 **环境前提**：Node ≥ 18；store 零 npm 依赖（只用 `node:` 内置模块）。**`codex` 通常不在 PATH**——脚本会按 `--worker-cmd` → `AGENT_TEAM_WORKER_CMD` → `CODEX_CLI_PATH` → 常见安装目录探测的顺序解析可执行文件，都找不到会明确报错。别裸写 `codex exec`。
 
+**teammate 只能用 store 内那份 CLI 副本。** `init` 会把一份逐字节一致的副本放到 `<dir>/bin/agent-team.mjs`（`init` 结果的 `teammateCli` 就是它的绝对路径）。**不要让 teammate 去跑 `~/.codex/skills/...` 里的原件**：worker 沙箱只覆盖 workdir，而 skill 原件在它之外；Windows 上 `C:\Users\<你>` 通常是 junction，node 解析它会直接 `EPERM: operation not permitted`。默认 worker 命令已经带上 `--sandbox workspace-write -C <cwd> --add-dir <dir>`（`codex exec` **不带 `--sandbox` 时默认 read-only**，teammate 会写不了 store）。**自己传 `--worker-cmd` 时，这两件事由你负责。**
+
 **核心原则：持久日志，派生状态。** 所有协作状态先落盘再报告成功。**已经返回 `queued` 的消息绝不重发**——它已经安全存储。
 
 ## 何时用 / 何时不用
@@ -96,11 +98,11 @@ $TEAM team_task_create --subject "逆向协议文档" \
   --description "产出 protocol.md 与 team-model.md；验收：字段与源码逐项一致" \
   --write-scopes "references/protocol.md,references/team-model.md" --as lead
 
-# 2. 创建 teammate，把任务 id 写进 prompt（它要自己 claim）
-#    --worker-cmd 省略时会自动解析 codex 可执行文件（本机 codex 不在 PATH，别裸写 codex）
-$TEAM spawn_teammate --name protocol-scribe --description "逆向协议文档" \
-  --prompt "领取 task-1：team_task_get 读它，用当前 revision claim，做完 complete。写入范围只有 references/protocol.md 与 references/team-model.md。完成后 send_message 向 lead 汇报。" \
-  --worker-cmd '"C:\Users\UserX\AppData\Local\OpenAI\Codex\bin\be3fd7e5c1969ff6\codex.exe" exec --skip-git-repo-check -C . --sandbox workspace-write --json'
+# 2. 创建 teammate，把任务写进 prompt（它要自己 claim）
+#    --bootstrap 会追加一段引导：store 内副本的绝对路径 + 调用循环（强烈建议加）
+#    不传 --worker-cmd 时用默认命令（已含 --sandbox workspace-write -C <cwd> --add-dir <dir>）
+$TEAM spawn_teammate --name protocol-scribe --description "逆向协议文档" --bootstrap \
+  --prompt "领取 task-1：用 team_task_get 读它，用当前 revision claim，做完 complete。写入范围只有 references/protocol.md 与 references/team-model.md。完成后 send_message 向 lead 汇报。"
 
 # 3. 巡查与推进
 $TEAM list_agents

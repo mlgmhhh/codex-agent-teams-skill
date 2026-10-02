@@ -71,8 +71,8 @@ cp -r codex-agent-teams-skill/agent-teams ~/.codex/skills/agent-teams
 ```powershell
 $TEAM = "$env:USERPROFILE\.codex\skills\agent-teams\scripts\agent-team.mjs"
 
-node $TEAM init                                   # 初始化（每个工作区一次，幂等）
-node $TEAM spawn_teammate --name reviewer --description "审协议" --prompt "…"
+node $TEAM init                                   # 初始化（每个工作区一次，幂等）；结果里的 teammateCli 就是 teammate 要用的 CLI
+node $TEAM spawn_teammate --name reviewer --description "审协议" --bootstrap --prompt "…"
 node $TEAM list_agents                            # 成员与状态
 node $TEAM send_message --target reviewer --message "先做第 1 节"
 node $TEAM wait_agent --timeout-ms 300000         # 先 list 再 wait；不会唤醒 inactive 成员
@@ -132,7 +132,8 @@ node extras/selftest.mjs        # 期望 TOTAL pass=162 fail=0, exit 0
 
 诚实清单（完整版见 `agent-teams/scripts/README.md` §7 与 `VERIFICATION.md` §4）：
 
-- **真实 `codex exec` worker 一跳未在作者机器上端到端验证**：那台机器 `codex` 不在 PATH，且外层网络/MCP 故障。**全部 238 项 E2E 都用假 worker 驱动 store，未伪造任何 codex 输出。** 你第一次用真 teammate 时若失败，先用 `extras/selftest.mjs` 区分是环境问题还是 skill 问题。
+- **真实 `codex exec` worker 一跳已在作者机器上端到端验证通过**（2026-10-02，真实模型）：worker 启动 → 收到逐字身份前缀 → 认领任务（revision 1→2）→ 完成任务（2→3）→ 发消息给 Lead → Lead 确认收到。它需要三个前提，都已在 `--bootstrap` 与默认命令里处理好：① teammate 只用 **store 内 CLI 副本**（`init` 产出的 `<dir>/bin/agent-team.mjs`）——worker 沙箱只覆盖 workdir，而 skill 原件在 `~/.codex/skills/`，Windows 上 `C:\Users\<你>` 是 junction，node 解析它会 `EPERM`；② worker 命令必须显式 `--sandbox workspace-write`（`codex exec` 不带它时默认 **read-only**，teammate 会写不了 store）；③ 需要网络时设好代理（codex/git/node 都不读系统代理）。
+- **只读沙箱的 teammate 无法与 store 通信**：它写不了 `lock`/`journal`，所以不能认领任务、也不能汇报。要"只读审查"，请给 `workspace-write --add-dir <store>` 并用 prompt 约束只读，而不是用 `--sandbox read-only`。
 - **单进程、共享 checkout**：全员同一个 cwd，没有 worktree 隔离、没有文件锁、没有自动合并。需要强隔离请用 `git worktree` + 多个独立会话。
 - **write-scope 只是提示**：Bash、formatter、代码生成器能绕过一切检查，必须由 Lead 检查最终 diff。
 - **扁平且不可变的 roster**：只有 Lead 能创建直接 teammate；无嵌套团队、无重命名、无删除、无名字复用。

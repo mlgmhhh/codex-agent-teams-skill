@@ -72,7 +72,11 @@ node extras\selftest.mjs      # 期望 TOTAL pass=162 fail=0, exit 0
 ## 5. 注意事项
 
 - **每个 teammate 是一次真实的模型调用**，会消耗额度。按独立工作流的数量开（通常 3–4 个：几个干活 + 一个独立复核），默认上限 8 个。
+- **开 teammate 时加上 `--bootstrap`**：它会在你的 prompt 后面追加一段引导，写好 teammate 该用哪份 CLI（store 内副本）和调用循环。**teammate 千万不要去跑 `~/.codex/skills/...` 里的原件** —— worker 沙箱只覆盖工作目录，而 skill 原件在它之外；Windows 上 `C:\Users\<你>` 是 junction，node 解析它会直接报 `EPERM`。不加 `--bootstrap` 且 prompt 没提副本路径时，脚本会打印警告提醒你。
+- **不要用 `--sandbox read-only` 跑 teammate**：只读沙箱下它写不了 store 的 `lock`/`journal`，于是认领不了任务也汇报不了。默认命令已带 `--sandbox workspace-write -C <cwd> --add-dir <store>`（`codex exec` 不带 `--sandbox` 时默认是 read-only）；**自己传 `--worker-cmd` 就要自己带这两样**。
 - **`codex` 可能不在 PATH**：脚本会按 `--worker-cmd` → `AGENT_TEAM_WORKER_CMD` → `CODEX_CLI_PATH` → 常见安装目录的顺序自动定位可执行文件；找不到会明确报错，不要裸写 `codex exec`。
+- **需要联网时记得配代理**：`codex` / `git` / `node` **都不会自动读系统代理**，只认 `HTTPS_PROXY`/`HTTP_PROXY` 环境变量。国内网络下这经常表现成"网络故障"，其实只是没配代理。
+- **teammate 的 prompt 尽量用 ASCII**：实测中文 prompt 经 stdin 可能被按本地代码页解码而乱码（ASCII 命令部分不受影响）。`--bootstrap` 追加的那段本身就是纯 ASCII。
 - **文档里的 `C:\Users\UserX\...` 路径是"逆向来源出处"的标注**（原作者机器上被逆向的 DSH 插件源码位置），**不是运行时依赖**——在你机器上这些路径不存在是正常的，不用管。唯一需要改的是 `extras\selftest.mjs` 那两行。
 - **`.agent-team/` 建议加进 `.gitignore`**：团队状态（`journal.jsonl` 是唯一真源）默认写在当前工作目录下。
 - **Lead 的身份恒为字面量 `lead`**；`init --lead-name` 只是展示标签、不产生第二个身份，**建议不要用**（相关设计说明见 `references/codex-runtime.md` §4.1）。

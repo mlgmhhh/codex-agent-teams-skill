@@ -68,8 +68,8 @@ node scripts/agent-team.mjs <command> [options]
 
 | 命令 | 参数 | 输出 |
 |---|---|---|
-| `init` | `--lead-name`(默认 `lead`；**纯展示标签**，见 §4.1，**推荐不要使用**)、`--max-members`(8)、`--max-tasks`(256)、`--max-pending-per-member`(64)、`--max-message-bytes`(65536) | `{teamId, lead, limits}` |
-| `spawn_teammate` | `--name`(必填, lower-kebab-case)、`--description`(必填)、`--prompt` 或 `--prompt-file`(必填)、`--context fresh\|fork`(默认 fresh)、`--worker-cmd`、`--run-sync` | `{member: MEMBER_VIEW}` |
+| `init` | `--lead-name`(默认 `lead`；**纯展示标签**，见 §4.1，**推荐不要使用**)、`--max-members`(8)、`--max-tasks`(256)、`--max-pending-per-member`(64)、`--max-message-bytes`(65536) | `{teamId, lead, limits, teammateCli}`（`teammateCli` = store 内 CLI 副本，见 §6.0） |
+| `spawn_teammate` | `--name`(必填, lower-kebab-case)、`--description`(必填)、`--prompt` 或 `--prompt-file`(必填)、`--context fresh\|fork`(默认 fresh)、`--worker-cmd`、`--run-sync`、`--bootstrap` | `{member: MEMBER_VIEW}` |
 | `list_agents` | — | `MEMBER_VIEW[]` |
 | `send_message` | `--target`(必填)、`--message` 或 `--message-file`(必填) | `{messageId, status}` |
 | `wait_agent` | `--timeout-ms`(10000–3600000，默认 30000) | `{timedOut, noProgress?}` |
@@ -185,29 +185,41 @@ node scripts/agent-team.mjs <command> [options]
 
 把 `-a never` 放进 `codex exec` 会直接报未知参数。无头 worker 要避免审批阻塞，应使用 `codex exec` 自己的 `-s`，或 `--dangerously-bypass-approvals-and-sandbox`（有风险，见 6.3）。
 
-### 5.6 实跑观测：JSONL 事件形状与失败表现
+### 5.6 实跑观测：JSONL 事件形状、失败表现，以及那个被误判的"网络故障"
 
 在本机实际执行 `codex exec ... --json -o <file>`（prompt 走 stdin）观测到：
 
-- stdout 是**逐行 JSON**，观测到的行形如 `{"type":"error","message":"..."}` 与 `{"type":"turn.failed","error":{"message":"..."}}`。事件 `type` 是点分/蛇形字符串，逐行独立可解析。
-- 本机该次运行**未能完成 turn**：日志出现 `Reconnecting... 1/5` …`5/5`、`Falling back from WebSockets to HTTPS transport`、`workspace routing discovery timed out`、`workspace routing discovery failed`，并伴随 MCP 传输错误（`https://chatgpt.com/backend-api/ps/mcp` 请求失败）。进程退出码 `1`。
-- turn 失败时 `-o` 指定的 last-message 文件**未被写出**（文件不存在）。因此 worker 结果读取必须容忍"没有 last message"。
-
-这条观测对 store 有直接含义：**worker 失败要落 `member/failed` 而不是 `member/active` 之后的静默空结果**；`-o` 文件缺失即视为本 turn 无产出。
+- stdout 是**逐行 JSON**，形如 `{"type":"error","message":"..."}` 与 `{"type":"turn.failed","error":{...}}`；事件 `type` 是点分/蛇形字符串，逐行独立可解析。
+- turn 失败时 `-o` 指定的 last-message 文件**不会被写出**。因此 worker 结果读取必须容忍"没有 last message"：**失败要落 `member/failed`**，而不是在 `member/active` 之后留一个静默空结果。
+- **更正（2026-10-02）**：本节早先记录的 `workspace routing discovery failed` + MCP 传输失败，
+  并**不是**"网络/MCP 故障"。真因是本机 **codex / git / node 默认都不读系统代理**
+  （本机系统代理 `http://127.0.0.1:12450`，DNS 走 Clash 风格 fake-IP `198.18.x.x`）。
+  设上 `HTTPS_PROXY`/`HTTP_PROXY` 后 `codex exec` **立刻可用**（实测 22 秒返回）。
+  排障时先确认代理，再怀疑网络。
 
 ## 6. worker 接线：推荐 worker-cmd
 
 三条都可直接复制，flag 全部经 `codex exec --help` 实证（见 5.2）。`<cwd>` 是共享工作目录，`<dir>` 是 `--dir`。prompt 一律走 **stdin**。
 
-### 6.1 推荐 A（默认）：只读 reviewer / verifier
+### 6.0 两条硬前提（2026-10-02 用真实 worker 实测）
+
+1. **teammate 只能用 store 内的 CLI 副本 `<dir>/bin/agent-team.mjs`**（`init` 产出的、与脚本逐字节一致的那份，`init` 结果里的 `teammateCli`）。worker 沙箱是 `workspace-write [workdir, ...]`，而 skill 原件在 `~/.codex/skills/`（workdir 之外）；Windows 上 `C:\Users\<你>` 常是 **junction**，node 加载脚本时向上 realpath 会直接报 `EPERM: operation not permitted, stat 'C:\Users\<你>'`——连 `status` 都跑不起来。副本被删/被改，下次 `init` 或 `spawn_teammate` 会自动重建。
+2. **`codex exec` 不带 `--sandbox` 时默认是 `read-only`**。此时 teammate 能读 store 但创建不了 `<dir>/lock`、写不了 `journal.jsonl`，**每条写命令都失败**成 `E_LOCK_FAILED: EPERM ... mkdir '<dir>/lock'`。所以 worker 命令必须显式 `--sandbox workspace-write`，并建议 `--add-dir <dir>` 把 store 也纳入可写范围（store 不在 `<cwd>` 之下时尤其必要）。
+
+不加 `--worker-cmd` 时 store 生成的默认命令已经是：
+`"<codex>" exec --skip-git-repo-check --sandbox workspace-write -C "<cwd>" --add-dir "<dir>"`
+**自己传 `--worker-cmd` 就要自己带这两样。** `spawn_teammate --bootstrap` 会在你的 prompt 之后追加一段引导（副本绝对路径 + 调用循环，含"子命令必须在最前"的正确写法）。
+
+### 6.1 推荐 A：先别用只读沙箱做 teammate
 
 ```powershell
-& "C:\Users\UserX\AppData\Local\OpenAI\Codex\bin\be3fd7e5c1969ff6\codex.exe" exec --skip-git-repo-check -C <cwd> --sandbox read-only --json -o <dir>\workers\<name>.last.txt
+# 只读沙箱下 teammate **写不了 store**：不能 claim/complete，也不能 send_message。
+& "..." exec --skip-git-repo-check -C <cwd> --sandbox read-only --json -o <dir>\workers\<name>.last.txt
 ```
 
-只读 teammate（审查、核对、勘察）直接用这条。`--sandbox read-only` 保证它不能改文件，与官方"write scope 只是 advisory"形成互补：**这里是真的强制**。
+只读沙箱对"审查别人的代码"很有价值，但它与 store 天然冲突：**teammate 要汇报就必须能写 `journal.jsonl`**。要"只读地审查"，正确做法是给它 `--sandbox workspace-write --add-dir <dir>`（写权限只用于 store 通信），并在 prompt 里明确**只许读代码、不许改代码**——约束靠指令，不靠沙箱。真要硬隔离，用 `--add-dir` 只开放 store 与只读挂载的源码目录。
 
-### 6.2 推荐 B：写工作 worker（实现类 teammate）
+### 6.2 推荐 B：写工作 worker（实现类 teammate）—— 也是默认形态
 
 ```powershell
 & "C:\Users\UserX\AppData\Local\OpenAI\Codex\bin\be3fd7e5c1969ff6\codex.exe" exec --skip-git-repo-check -C <cwd> --sandbox workspace-write --add-dir <dir> -m <model> --json -o <dir>\workers\<name>.last.txt
@@ -381,19 +393,26 @@ init
 | 消息大小/容量 | `maxMessageBytes` / `maxPendingMessagesPerMember` | 同上限，同错误码（`TEAM_MESSAGE_TOO_LARGE` / `TEAM_MAILBOX_FULL`） | — |
 | write scope | 规范化前缀 + advisory 重叠警告 | 同规则、同警告、**同样绝不阻止** | 强制隔离只能靠 Codex 的 `--sandbox`，那是另一层 |
 | 角色定义 | 无（`spawn_teammate` 只收 description + prompt） | 可挂 `~/.codex/agents/*.toml` 的三字段做角色库 | 本 skill 的增强，非官方行为 |
+| teammate 侧入口 | 同一进程内直接调用服务方法 | store 内自带一份 `bin/agent-team.mjs` 副本供 worker 调用（§6.0） | worker 沙箱只覆盖 workdir，跨沙箱调用必须把入口放进 workdir |
 
 ## 11. 本机环境限制与待确认
 
-**实测到的阻塞（影响可信度，必须如实记录）：**
+**实测到的事实（2026-10-02 更新）：**
 
-- `codex` **不在 PATH**（5.1）→ _spec.md §4.4 的默认 worker-cmd 在本机不可用，必须换绝对路径或显式 `--worker-cmd`。
-- `codex exec` 在本机**无法完成一次真实 turn**：网络侧 `workspace routing discovery failed` + MCP 传输失败（`https://chatgpt.com/backend-api/ps/mcp`）。因此"推荐 worker-cmd 能跑通并产出 last message"这一点**未被端到端验证**。已确证的只是：CLI 接受 5.2 全部 flag、正常加载 config 与 hook、按 `--json` 输出 JSONL、失败时退出码 1 且不写 `-o` 文件。
+- `codex` **不在 PATH**（5.1）→ 裸写 `codex exec` 不可用；store 会自动探测安装目录，也可显式 `--worker-cmd`。
+- **真实 `codex exec` worker 一跳已端到端验证通过**（前提见 §6.0，另需本机设 `HTTPS_PROXY`）。
+  早先这里记的"无法完成真实 turn / 网络侧失败"是**误判**：根因是 codex/git/node 默认都不读
+  系统代理 `http://127.0.0.1:12450`。设上代理后 `codex exec` 22 秒返回，真实 teammate 能
+  `claim` → `complete` → `send_message` 汇报，Lead 能 `inbox --ack` 收到。
+- 用**只读**沙箱的 worker **无法**与 store 通信（写不了 `lock`/`journal`），见 §6.1。
 
 **待确认清单：**
 
 1. 【待确认】`codex exec` 能否以某个 `~/.codex/agents/*.toml` 的 custom agent 身份启动（无 `--agent` flag 实证）。
-2. 【待确认】`codex exec resume` / `fork` 缺 `-s/--sandbox` 与 `-C/--cd` 时，`-c` 覆盖 cwd 与沙箱的**确切 config key**（如 `-c sandbox_mode=...` 是否生效）。
+2. 【待确认】`codex exec resume` / `fork` 缺 `-s/--sandbox` 与 `-C/--cd` 时，`-c` 覆盖 cwd 与沙箱的**确切 config key**。
 3. 【待确认】`-p/--profile` 叠加的 `<name>.config.toml` 是否可以承载 custom agent 定义。
-4. 【待确认】本机网络恢复后，推荐 worker-cmd 的完整成功路径（last message 写出、JSONL 事件类型全集）。
-5. 【待确认】`wait_agent` 在纯文件 store 上的实现（轮询 vs 长时观察）与其 `noProgress: {reason:"no-active-peer"}` 精确触发条件。
-6. 【推断】陈旧锁按 mtime 回收的**具体阈值**：官方没有对应物，阈值由脚本自定。
+4. 【待确认】`wait_agent` 在纯文件 store 上 `noProgress: {reason:"no-active-peer"}` 的精确触发条件。
+5. 【推断】陈旧锁按 mtime 回收的**具体阈值**：官方没有对应物，阈值由脚本自定。
+6. 【待确认】**非 ASCII prompt 经 stdin 可能被按本地代码页解码**：实测中文 prompt 在 worker 日志里
+   显示为 mojibake（ASCII 命令部分不受影响，任务仍能完成）。规避：teammate prompt 尽量用 ASCII，
+   或先确认你的 codex 版本按 UTF-8 读 stdin。`--bootstrap` 追加的那段本身就是纯 ASCII。

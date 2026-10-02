@@ -50,6 +50,7 @@ node scripts/agent-team.mjs team_task_update --task-id task-1 --expected-revisio
 <dir>/team.json                     # { version, teamId, lead, createdAt, limits }
 <dir>/journal.jsonl                 # 唯一真源：append-only 事件日志，每行一个 JSON
 <dir>/lock/                         # mkdir 互斥锁（CAS 与所有写操作在此串行）
+<dir>/bin/agent-team.mjs            # CLI 副本 —— **teammate 必须用这个**，见 §4.0
 <dir>/workers/<name>.prompt.txt     # 送进 worker stdin 的完整 prompt（含逐字身份前缀）
 <dir>/workers/<name>.log            # worker 的 stdout/stderr
 <dir>/workers/<name>.pid            # { pid, startedAt, command }，用于推导 running/inactive
@@ -87,8 +88,8 @@ node scripts/agent-team.mjs team_task_update --task-id task-1 --expected-revisio
 
 | 命令 | 参数 | 输出 |
 |---|---|---|
-| `init` | `--lead-name`(lead，纯展示标签) `--max-members`(8) `--max-tasks`(256) `--max-pending-per-member`(64) `--max-message-bytes`(65536) | `{teamId, lead, limits}` |
-| `spawn_teammate` | `--name` `--description` (`--prompt`\|`--prompt-file`) `--context fresh\|fork` `--worker-cmd` `--run-sync` | `{member: MEMBER_VIEW}` |
+| `init` | `--lead-name`(lead，纯展示标签) `--max-members`(8) `--max-tasks`(256) `--max-pending-per-member`(64) `--max-message-bytes`(65536) | `{teamId, lead, limits, teammateCli}` |
+| `spawn_teammate` | `--name` `--description` (`--prompt`\|`--prompt-file`) `--context fresh\|fork` `--worker-cmd` `--run-sync` `--bootstrap` | `{member: MEMBER_VIEW}` |
 | `list_agents` | — | `MEMBER_VIEW[]` |
 | `send_message` | `--target` (`--message`\|`--message-file`) | `{messageId, status: accepted\|queued}` |
 | `wait_agent` | `--timeout-ms`(30000, 10000–3600000) | `{timedOut, noProgress?}` |
@@ -108,10 +109,21 @@ JSON**，该开关保留给未来的人类可读模式）。
 `--blocked-by` / `--write-scopes` 是逗号分隔列表（每项去首尾空格，空项丢弃）；
 也可用 `--task_id` 这种下划线写法，参数名里的 `_` 与 `-` 等价。
 
+**顺序要求：子命令必须在最前。** `agent-team.mjs <子命令> [选项]`。把 `--dir` 之类的全局选项写到
+子命令之前会得到 `E_USAGE`（实测：`agent-team.mjs --dir X status` → `unexpected positional argument`）。
+（真实 worker 曾因为第一版 `--bootstrap` 模板写成了选项前置而全部失败，现已修正。）
+
 **`init` 的幂等语义**：对已初始化的 store 再跑 `init` 会返回**同一 `teamId`**、
 **不修改既有 `lead`/`limits`**，合法但与既有配置不同的新参数（如 `--max-members 16`）**被忽略**；
 但**参数仍会校验**——非法值报 `TEAM_INVALID_CONFIG`（例如 `--max-members 0`，exit 2）、
 `--lead-name` 违反命名规则报 `TEAM_INVALID_MEMBER_NAME`（exit 2）。所以"幂等"≠"静默吞掉参数"。
+
+注意副作用：`init` 会**先建目录与 CLI 副本、再校验 limits**，所以一次失败的 `init`（如
+`--max-members 0`）仍会留下 `<dir>/bin/`、`<dir>/journal.jsonl`、`<dir>/workers/` 这些空壳
+（与既有的"先建目录"行为一致）。想彻底清干净就删掉整个 `<dir>`。
+
+另外：布尔 flag（`--json` / `--ack` / `--all` / `--run-sync` / `--bootstrap`）是**全局**的，
+所以与子命令无关的布尔 flag 会被静默接受（例如 `status --bootstrap`），与既有 `--ack` 同理。
 
 ### 退出码与错误输出
 
@@ -179,15 +191,40 @@ _worker_launcher --(shell, stdio=[promptFile, log, log])--> worker
 pid 文件并写下 `launch-result.json`，`spawn_teammate` 正是用它判断"启动成功 / 立刻失败"。
 `--run-sync` 不走 launcher（前台直接跑 worker，退出码即结论）。
 
+### 4.0 teammate 必须用 store 内的 CLI 副本（很重要）
+
+2026-10-02 用**真实 codex worker** 实测出来的两个坑，任何一个都会让 teammate 完全无法与 store 通信：
+
+1. **不要让它跑 `~/.codex/skills/...` 里的原件。** worker 沙箱是 `workspace-write [workdir, ...]`，
+   而 skill 原件在 workdir 之外；Windows 上 `C:\Users\<你>` 常是 **junction**，node 加载脚本时向上
+   解析 realpath 会直接报 `EPERM: operation not permitted, stat 'C:\Users\<你>'`
+   （`Module._findPath` → `realpathSync`）—— 连 `status` 都跑不起来。
+   → `init` 会把一份**逐字节一致**的副本放到 `<dir>/bin/agent-team.mjs`，`init` 结果的
+   `teammateCli` 就是它的绝对路径。**teammate 一律用这个副本**；副本被删或被改，下次 `init`
+   或 `spawn_teammate` 会自动重建。
+2. **默认 worker 命令必须显式要可写沙箱。** `codex exec` **不带 `--sandbox` 时默认是 `read-only`**：
+   teammate 能读 store，但创建不了 `<dir>/lock`、写不了 `journal.jsonl`，于是**每条写命令都失败**成
+   `E_LOCK_FAILED: EPERM ... mkdir '<dir>/lock'`。
+   → store 生成的默认命令已带 `--sandbox workspace-write -C <cwd> --add-dir <dir>`；
+   **如果你自己传 `--worker-cmd`，这两件事由你负责。**
+
+推荐做法：给 `spawn_teammate` 加 **`--bootstrap`**。它会在你的 prompt **之后**追加一段引导，写明
+store 内副本的绝对路径与调用循环（含"子命令必须在最前"的正确写法）。不加 `--bootstrap` 且 prompt
+里也没提到副本路径时，脚本会往 stderr 打警告提醒你。默认不加时，worker 收到的 prompt 与官方语义
+一致（身份前缀 + 你的 prompt，逐字）。
+
 ### 三个推荐用法
 
 ```powershell
-# A) 默认：自动定位 codex，fresh 上下文，共享 cwd，跳过 git 仓库检查
-node scripts/agent-team.mjs spawn_teammate --name builder --description "实现" --prompt "..."
+# A) 默认（推荐）：自动定位 codex + 自动带上 --sandbox workspace-write -C <cwd> --add-dir <store>，
+#    fresh 上下文，跳过 git 仓库检查。--bootstrap 追加"如何与团队通信"的引导段。
+node scripts/agent-team.mjs spawn_teammate --name builder --description "实现" --bootstrap --prompt "..."
 
-# B) 显式沙箱与模型（-s / -C / -m 都是 codex exec 接受的 flag）
-$env:AGENT_TEAM_WORKER_CMD = '"C:\Users\UserX\AppData\Local\OpenAI\Codex\bin\<hash>\codex.exe" exec --skip-git-repo-check -s workspace-write -C "D:\ai" -m <model>'
-node scripts/agent-team.mjs spawn_teammate --name verifier --description "复测" --prompt "..."
+# B) 显式沙箱与模型。**必须自己带上 --sandbox workspace-write 与 --add-dir <store>**，
+#    否则 codex exec 默认 read-only，teammate 会写不了 store（E_LOCK_FAILED）。
+#    另外自己写 prompt 时要用 store 内副本（init 结果的 teammateCli），并让子命令在最前。
+$env:AGENT_TEAM_WORKER_CMD = '"C:\Users\UserX\AppData\Local\OpenAI\Codex\bin\<hash>\codex.exe" exec --skip-git-repo-check --sandbox workspace-write -C "D:\ai" --add-dir "D:\ai\.agent-team" -m <model>'
+node scripts/agent-team.mjs spawn_teammate --name verifier --description "复测" --bootstrap --prompt "..."
 
 # C) 任意本地程序当 worker（自测用假 worker 就是这条路径）
 node scripts/agent-team.mjs spawn_teammate --name fake --description "假 worker" `
@@ -296,10 +333,14 @@ worker 读消息的两条路（等价，都不依赖第二份真源）：
 10. **tombstone 语义**：`delete` 后任务不再出现在 `team_task_list`，但 `team_task_get` 仍返回
     `status:"deleted"` 的完整快照；id 不复用（`task-<n>` 单调递增），`maxTasks` 不占用。
 11. **没有 worktree / 远端成员 / merge / 文件锁**：与官方一致，所有成员共享同一 cwd 与文件系统。
-12. **真实 `codex exec` worker 一跳未在本机端到端验证**：本机 `codex` 不在 PATH（脚本会自动探测
-    安装目录），且外层环境存在网络侧 `workspace routing discovery failed` 与 MCP 传输失败，
-    无法跑通一次真实 worker turn。**自测全部使用 `--worker-cmd` 指向本地 node 假 worker**，
-    没有伪造 codex 输出。
+12. **真实 `codex exec` worker 一跳已端到端验证通过**（2026-10-02，用真实模型）。实测链路：
+    worker 启动 → 收到逐字身份前缀 → `team_task_list` → `claim`（revision 1→2）→ `complete`
+    （revision 2→3）→ `send_message` 汇报 → Lead 用 `inbox --target lead --ack` 收到。
+    它需要三个前提（见 §4.0）：teammate 只用 **store 内副本**、默认命令必须显式
+    **`--sandbox workspace-write`**、以及本机必须设系统代理 `HTTPS_PROXY=http://127.0.0.1:12450`
+    （codex/git/node 默认都不读系统代理，不设会表现成"网络故障"）。
+    **更正**：更早版本这里写"因网络/MCP 故障无法验证"——那是**误判**，真正的根因是没配代理；
+    验证通过后剩余的阻塞是沙箱（已修）。
 13. **`_worker_launcher` 是内部子命令**（【推断】实现细节）：`spawn_teammate` 后台启动时用它
     拉起 worker；它不读 store、不输出 stdout，参数只有一个 `launch.json` 路径。用户不应直接调用。
 14. **`inbox --all` 是本 store 的扩展**：官方没有 inbox 命令（官方把消息 steer 进目标会话）。
@@ -327,6 +368,13 @@ worker 读消息的两条路（等价，都不依赖第二份真源）：
     （官方 `lib/index.js:1617` 同位置）；`team_task_list` 的顺序是 身份（`TEAM_NOT_MEMBER`）
     → 过滤 → cursor/limit（官方 `tool-agent-team/lib/index.js:434-441`），其中
     `INVALID_CURSOR` / `INVALID_LIMIT` 仍是非 `TEAM_` 前缀 + exit 1（见第 6 条）。
+
+18. **teammate 用的 CLI 在 store 内部**（`<dir>/bin/agent-team.mjs`）：为绕开 worker 沙箱边界与
+    Windows junction 的 `EPERM`（见 §4.0）。它是**工具**不是状态，可从脚本重建，不违反
+    "journal 是唯一真源"；`init` 结果的 `teammateCli` 给出它的绝对路径。
+19. **`--bootstrap` 是本 store 的扩展**：官方只把"身份前缀 + Lead 的 prompt"原样发给 teammate，
+    本 store **默认保持同样的语义**（逐字）；加 `--bootstrap` 才在**你的 prompt 之后**追加一段引导
+    （store 内副本的绝对路径 + 调用循环）。不加、且 prompt 里也没提到副本路径时会给 stderr 警告。
 
 ## 8. 自测
 
